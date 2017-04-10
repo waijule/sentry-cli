@@ -853,6 +853,16 @@ impl ApiResponse {
         })?)
     }
 
+    /// Convert the response body into a byte vector
+    pub fn body_as_bytes(self) -> ApiResult<Vec<u8>> {
+        Ok(self.body.unwrap_or(vec![]))
+    }
+
+    /// Convert the response body into a string
+    pub fn body_as_string(self) -> ApiResult<String> {
+        Ok(String::from_utf8_lossy(&self.body_as_bytes()?).into_owned())
+    }
+
     /// Like `deserialize` but consumes the response and will convert
     /// failed requests into proper errors.
     pub fn convert<T: Deserialize>(self) -> ApiResult<T> {
