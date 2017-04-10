@@ -53,6 +53,7 @@ extern crate prettytable;
 extern crate git2;
 extern crate humansize;
 extern crate java_properties;
+extern crate html5ever;
 
 mod macros;
 

@@ -31,6 +31,7 @@ macro_rules! each_subcommand {
         $mac!(info);
         $mac!(login);
         $mac!(send_event);
+        $mac!(analyze_sourcemaps);
         #[cfg(target_os="macos")]
         $mac!(react_native_xcode);
         $mac!(react_native_gradle);
@@ -49,6 +50,7 @@ pub mod uninstall;
 pub mod info;
 pub mod login;
 pub mod send_event;
+pub mod analyze_sourcemaps;
 
 #[cfg(target_os="macos")]
 pub mod react_native_xcode;

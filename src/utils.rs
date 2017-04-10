@@ -64,8 +64,8 @@ impl<'a> fmt::Display for HumanSize {
 pub struct Logger;
 
 impl log::Log for Logger {
-    fn enabled(&self, _metadata: &log::LogMetadata) -> bool {
-        true
+    fn enabled(&self, metadata: &log::LogMetadata) -> bool {
+        metadata.target() != "html5ever::tree_builder::actions"
     }
     fn log(&self, record: &log::LogRecord) {
         if !self.enabled(record.metadata()) {

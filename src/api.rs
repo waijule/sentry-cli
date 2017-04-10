@@ -20,9 +20,13 @@ use serde::{Serialize, Deserialize};
 use serde_json;
 use url::percent_encoding::{utf8_percent_encode, DEFAULT_ENCODE_SET};
 use curl;
+use url;
 use regex::Regex;
 use chrono::{Duration, DateTime, UTC};
 use pbr;
+use html5ever::parse_document;
+use html5ever::rcdom::RcDom;
+use html5ever::tendril::TendrilSink;
 
 use utils;
 use event::Event;
@@ -70,9 +74,11 @@ pub enum Error {
     Curl(curl::Error),
     Form(curl::FormError),
     Io(io::Error),
+    Url(url::ParseError),
     Json(serde_json::Error),
     ResourceNotFound(&'static str),
     NoDsn,
+    NoHtml,
 }
 
 /// Shortcut alias for results of this module.
@@ -111,6 +117,7 @@ pub struct ApiRequest<'a> {
 /// Represents an API response.
 #[derive(Clone, Debug)]
 pub struct ApiResponse {
+    url: url::Url,
     status: u32,
     headers: Vec<String>,
     body: Option<Vec<u8>>,
@@ -167,6 +174,11 @@ impl<'a> Api<'a> {
     /// Convenience method that performs a `GET` request.
     pub fn get(&self, path: &str) -> ApiResult<ApiResponse> {
         self.request(Method::Get, path)?.send()
+    }
+
+    /// Convenience method that performs a `GET` request and follows redirects.
+    pub fn get_handle_redirect(&self, path: &str) -> ApiResult<ApiResponse> {
+        self.request(Method::Get, path)?.follow_location(true)?.send()
     }
 
     /// Convenience method that performs a `DELETE` request.
@@ -765,7 +777,9 @@ impl<'a> ApiRequest<'a> {
         self.handle.http_headers(self.headers)?;
         let (status, headers) = send_req(&mut self.handle, out, self.body, progress)?;
         info!("response: {}", status);
+        let url = url::Url::parse(self.handle.effective_url()?.unwrap())?;
         Ok(ApiResponse {
+            url: url,
             status: status,
             headers: headers,
             body: None,
@@ -820,6 +834,17 @@ impl ApiResponse {
         fail!(Error::Http(self.status(), "generic error".into()));
     }
 
+    /// Parse the response body as HTML
+    pub fn parse_html(&self) -> ApiResult<RcDom> {
+        if let Some(ref body) = self.body {
+            Ok(parse_document(RcDom::default(), Default::default())
+                .from_utf8()
+                .read_from(&mut body.as_slice())?)
+        } else {
+            fail!(Error::NoHtml)
+        }
+    }
+
     /// Deserializes the response body into the given type
     pub fn deserialize<T: Deserialize>(&self) -> ApiResult<T> {
         Ok(serde_json::from_reader(match self.body {
@@ -832,6 +857,11 @@ impl ApiResponse {
     /// failed requests into proper errors.
     pub fn convert<T: Deserialize>(self) -> ApiResult<T> {
         self.to_result().and_then(|x| x.deserialize())
+    }
+
+    /// Returns the URL of the response.
+    pub fn url(&self) -> &url::Url {
+        &self.url
     }
 
     /// Like convert but produces resource not found errors.
@@ -889,6 +919,18 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Error {
+        Error::Io(err)
+    }
+}
+
+impl From<url::ParseError> for Error {
+    fn from(err: url::ParseError) -> Error {
+        Error::Url(err)
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
@@ -896,9 +938,11 @@ impl fmt::Display for Error {
             Error::Curl(ref err) => write!(f, "http error: {}", err),
             Error::Form(ref err) => write!(f, "http form error: {}", err),
             Error::Io(ref err) => write!(f, "io error: {}", err),
+            Error::Url(ref err) => write!(f, "url error: {}", err),
             Error::Json(ref err) => write!(f, "bad json: {}", err),
             Error::ResourceNotFound(res) => write!(f, "{} not found", res),
             Error::NoDsn => write!(f, "no dsn provided"),
+            Error::NoHtml => write!(f, "no HTML response"),
         }
     }
 }
