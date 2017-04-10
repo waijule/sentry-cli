@@ -181,6 +181,11 @@ impl<'a> Api<'a> {
         self.request(Method::Get, path)?.follow_location(true)?.send()
     }
 
+    /// Convenience method that performs a `HEAD` request.
+    pub fn head(&self, path: &str) -> ApiResult<ApiResponse> {
+        self.request(Method::Head, path)?.follow_location(true)?.send()
+    }
+
     /// Convenience method that performs a `DELETE` request.
     pub fn delete(&self, path: &str) -> ApiResult<ApiResponse> {
         self.request(Method::Delete, path)?.send()

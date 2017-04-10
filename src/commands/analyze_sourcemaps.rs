@@ -54,6 +54,54 @@ fn find_scripts(url: &str, handle: &Handle) -> Result<Vec<Url>> {
     Ok(rv)
 }
 
+fn validate_sourcemap(api: &Api, url: &Url, body: &[u8]) -> Result<()> {
+    let prefix = "      ";
+    let sourcemap = match sourcemap::DecodedMap::from_reader(body)? {
+        sourcemap::DecodedMap::Regular(sm) => {
+            println!("{}sourcemap type: {}", prefix, "regular".cyan());
+            sm
+        }
+        sourcemap::DecodedMap::Index(sm) => {
+            println!("{}sourcemap type: {}", prefix, "index".yellow());
+            match sm.flatten() {
+                Ok(sm) => sm,
+                Err(err) => {
+                    println!("{}{}", prefix, "unsupported sourcemap index".red());
+                    return Err(err.into());
+                }
+            }
+        }
+    };
+
+    println!("{}sources: {}", prefix, sourcemap.get_source_count().to_string().yellow());
+    println!("{}tokens: {}", prefix, sourcemap.get_token_count().to_string().yellow());
+
+    for (idx, contents) in sourcemap.source_contents().enumerate() {
+        let source_url = sourcemap.get_source(idx as u32);
+        if contents.is_none() {
+            if let Some(ref source_ref) = source_url {
+                println!("{}  {}: no embedded sourcecode for {}", prefix,
+                         "warning".yellow(),
+                         source_ref.cyan());
+                let sourcecode_url = url.join(source_ref)?;
+                let resp = api.head(&sourcecode_url.to_string())?;
+                if resp.ok() {
+                    println!("{}  (but can scrape source at {})", prefix, resp.url().to_string().cyan());
+                } else {
+                    println!("{}  ({}: cannot scrape at {} [{}])",
+                             prefix, "error".red(), resp.url().to_string().cyan(), resp.status());
+                }
+            } else {
+                println!("{}  {}: invalid source reference {}", prefix,
+                         "warning".yellow(),
+                         format!("#{}", idx).cyan());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn execute<'a>(matches: &ArgMatches<'a>, config: &Config) -> Result<()> {
     let url = Url::parse(matches.value_of("url").unwrap())?;
     let url_str = url.to_string();
@@ -84,9 +132,16 @@ pub fn execute<'a>(matches: &ArgMatches<'a>, config: &Config) -> Result<()> {
         }
 
         println!("  ✓ {}", script_url_str.green());
+
+        let mut sm_ref_url = resp.get_header("sourcemap").or_else(|| {
+            resp.get_header("x-sourcemap")
+        }).map(|x| x.to_string());
         let body = resp.to_result()?.body_as_string()?;
-        let sm_ref = sourcemap::locate_sourcemap_reference_slice(body.as_bytes()).unwrap();
-        let sm_ref_url = sm_ref.get_url();
+        if sm_ref_url.is_none() {
+            let sm_ref = sourcemap::locate_sourcemap_reference_slice(body.as_bytes()).unwrap();
+            sm_ref_url = sm_ref.get_url().map(|x| x.to_string());
+        }
+
         if sm_ref_url.is_some() || might_be_minified::analyze_str(&body).is_likely_minified() {
             if let Some(ref url) = sm_ref_url {
                 let sm_url = script_url.join(url)?;
@@ -97,11 +152,13 @@ pub fn execute<'a>(matches: &ArgMatches<'a>, config: &Config) -> Result<()> {
                     println!("    ✕ {} [{}]", sm_url_str.red(), resp.status());
                 } else {
                     println!("    ✓ {}", sm_url_str.green());
-                    let body = resp.to_result()?.body_as_bytes()?;
+                    let body = resp.body_as_bytes()?;
                     if sourcemap::is_sourcemap_slice(&body) {
-                        println!("      {}", "is a sourcemap".cyan());
+                        if let Err(err) = validate_sourcemap(&api, &sm_url, &body) {
+                            println!("      {}: {}", "error parsing sourcemap".red(), err);
+                        }
                     } else {
-                        println!("      {}", "not a sourcemap".red());
+                        println!("      {} sourcemap", "not a valid".red());
                     }
                 }
             } else {
