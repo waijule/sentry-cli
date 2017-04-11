@@ -1,6 +1,8 @@
 //! Implements a command for analyzing sourcemaps at a URL.
 use std::cell::Ref;
+use std::fs;
 use std::env;
+use std::io::Read;
 use std::collections::HashSet;
 
 use prelude::*;
@@ -15,6 +17,7 @@ use colored::Colorize;
 use might_be_minified;
 use sourcemap;
 use walkdir;
+
 
 pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
     app.about("analyze sourcemaps for a URL")
@@ -68,8 +71,7 @@ fn find_scripts(url: &str, handle: &Handle) -> Result<Vec<Url>> {
     Ok(rv)
 }
 
-fn validate_sourcemap(api: &Api, url: &Url, body: &[u8]) -> Result<()> {
-    let prefix = "      ";
+fn validate_sourcemap(api: &Api, prefix: &str, url: &Url, body: &[u8]) -> Result<()> {
     let sourcemap = match sourcemap::DecodedMap::from_reader(body)? {
         sourcemap::DecodedMap::Regular(sm) => {
             println!("{}sourcemap type: {}", prefix, "regular".cyan());
@@ -116,9 +118,10 @@ fn validate_sourcemap(api: &Api, url: &Url, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn explain_upload_commands(sourcemaps: &[(Url, Option<Url>, bool)]) -> Result<()> {
-    let prefix = "  ";
-
+fn explain_upload_commands(api: &Api, org: &str, project: &str, version: &str,
+                           sourcemaps: &[(Url, Option<Url>, bool)])
+    -> Result<()>
+{
     let known_js_files: HashSet<String> = sourcemaps
         .iter()
         .map(|x| x.0.path().rsplit("/").next().unwrap().to_string())
@@ -145,22 +148,87 @@ fn explain_upload_commands(sourcemaps: &[(Url, Option<Url>, bool)]) -> Result<()
         }
     }
 
-    println!("{:?}", interesting_folders);
+    let mut upload_commands = HashSet::new();
+    let mut all_urls = HashSet::new();
 
-    for &(ref script_url, ref sm_ref, missing) in sourcemaps {
-        println!("{}◦ {}", prefix, script_url.to_string().cyan());
+    for &(ref script_url, ref sm_ref, _) in sourcemaps {
+        all_urls.insert((script_url.clone(), true));
         if let &Some(ref sm_ref) = sm_ref {
-            println!("{}  -> {}", prefix, sm_ref.to_string().magenta());
+            all_urls.insert((sm_ref.clone(), false));
+            continue;
         }
+        let mut url = script_url.clone();
+        let path = url.path().to_string();
+        url.set_path(&format!("{}.map", path));
+        all_urls.insert((url.clone(), true));
+    }
+
+    if !all_urls.is_empty() {
+        println!("› Validating local sourcemaps:");
+    }
+    let mut sourcemaps_found = 0;
+
+    for (url, is_script) in all_urls {
+        let url_str = url.to_string();
+        let mut iter = url_str.rsplitn(2, "/");
+        let filename = iter.next().unwrap();
+        let base = iter.next();
+        for path in &interesting_folders {
+            let full_path = path.join(filename);
+            if !full_path.is_file() {
+                continue;
+            }
+
+            if !is_script {
+                let mut f = fs::File::open(&full_path)?;
+                let mut contents = vec![];
+                f.read_to_end(&mut contents)?;
+                if sourcemap::is_sourcemap_slice(&contents) {
+                    println!("  ✓ {}", url_str.green());
+                    if let Err(err) = validate_sourcemap(&api, "    ", &url, &contents) {
+                        println!("    {}: {}", "error parsing sourcemap".red(), err);
+                    }
+                    sourcemaps_found += 1;
+                } else {
+                    println!("  ✕ {}", url_str.red());
+                    println!("    {} sourcemap", "not a valid".red());
+                }
+                println!("    (found at {})", full_path.display().to_string().cyan());
+            }
+
+            upload_commands.insert((
+                base.unwrap_or("~").to_string(),
+                path.to_string_lossy().into_owned(),
+            ));
+            break;
+        }
+    }
+
+    println!("");
+    if !upload_commands.is_empty() && sourcemaps_found > 0 {
+        println!("{}", "You can run these commands to upload your sourcemaps:".cyan());
+        println!("");
+        for (prefix, path) in upload_commands {
+            println!("  sentry-cli releases -o \"{}\" files -p \"{}\" \"{}\" \
+                      upload-sourcemaps --rewrite -u \"{}\" \"{}\"",
+                     org, project, version, prefix, path);
+        }
+    } else {
+        println!("{} :(", "Cannot find valid sourcemaps locally".red());
+        println!("  Looks like we could not found any matching sourcemaps.");
+        println!("  Consult the sentry docs for more information about how to");
+        println!("  generate sourcemaps.");
     }
 
     Ok(())
 }
 
 pub fn execute<'a>(matches: &ArgMatches<'a>, config: &Config) -> Result<()> {
+    let (org, project) = config.get_org_and_project(matches)?;
     let url = Url::parse(matches.value_of("url").unwrap())?;
     let url_str = url.to_string();
     let api = Api::new(config);
+    let releases = api.list_releases(&org, Some(&project))?;
 
     println!("› Finding scripts on {}", url_str.cyan());
 
@@ -221,7 +289,7 @@ pub fn execute<'a>(matches: &ArgMatches<'a>, config: &Config) -> Result<()> {
                     println!("    ✓ {}", sm_url_str.green());
                     let body = resp.body_as_bytes()?;
                     if sourcemap::is_sourcemap_slice(&body) {
-                        if let Err(err) = validate_sourcemap(&api, &sm_url, &body) {
+                        if let Err(err) = validate_sourcemap(&api, "      ", &sm_url, &body) {
                             println!("      {}: {}", "error parsing sourcemap".red(), err);
                         }
                     } else {
@@ -251,7 +319,12 @@ pub fn execute<'a>(matches: &ArgMatches<'a>, config: &Config) -> Result<()> {
     }
 
     if !sourcemaps.is_empty() {
-        explain_upload_commands(&sourcemaps)?;
+        let version = if releases.is_empty() {
+            "<RELEASE>".to_string()
+        } else {
+            releases[0].version.to_string()
+        };
+        explain_upload_commands(&api, &org, &project, &version, &sourcemaps)?;
     }
 
     Ok(())
