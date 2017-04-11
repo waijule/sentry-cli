@@ -1,9 +1,12 @@
 //! Implements a command for analyzing sourcemaps at a URL.
 use std::cell::Ref;
+use std::env;
+use std::collections::HashSet;
 
 use prelude::*;
 use api::Api;
 use config::Config;
+use utils::ArgExt;
 
 use clap::{App, Arg, ArgMatches};
 use url::Url;
@@ -11,14 +14,25 @@ use html5ever::rcdom::{Document, Element, Handle, Node};
 use colored::Colorize;
 use might_be_minified;
 use sourcemap;
+use walkdir;
 
 pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
     app.about("analyze sourcemaps for a URL")
+        .org_project_args()
         .arg(Arg::with_name("url")
             .required(true)
             .value_name("URL")
             .index(1)
             .help("the URL to analyze"))
+}
+
+fn is_community_cdn_url(url: &Url) -> bool {
+    let domain = url.domain();
+    domain == Some("ssl.google-analytics.com") ||
+    domain == Some("cdn.js.com") ||
+    domain == Some("ajax.googleapis.com") ||
+    domain == Some("cdn.ravenjs.com") ||
+    domain == Some("cdn.jsdelivr.net")
 }
 
 fn find_scripts(url: &str, handle: &Handle) -> Result<Vec<Url>> {
@@ -102,12 +116,53 @@ fn validate_sourcemap(api: &Api, url: &Url, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn explain_upload_commands(sourcemaps: &[(Url, Option<Url>, bool)]) -> Result<()> {
+    let prefix = "  ";
+
+    let known_js_files: HashSet<String> = sourcemaps
+        .iter()
+        .map(|x| x.0.path().rsplit("/").next().unwrap().to_string())
+        .collect();
+    let known_sm_files: HashSet<String> = sourcemaps
+        .iter()
+        .filter_map(|x| x.1.as_ref().map(|x| x.path().rsplit("/").next().unwrap().to_string()))
+        .collect();
+
+    let here = env::current_dir()?;
+    let mut interesting_folders = HashSet::new();
+
+    for dent_rv in walkdir::WalkDir::new(&here) {
+        if_chain! {
+            if let Ok(local) = dent_rv?.path().strip_prefix(&here);
+            if let Some(filename_os) = local.file_name();
+            if let Some(filename) = filename_os.to_str();
+            if known_js_files.contains(filename) ||
+               known_sm_files.contains(filename);
+            if let Some(folder) = local.parent();
+            then {
+                interesting_folders.insert(folder.to_path_buf());
+            }
+        }
+    }
+
+    println!("{:?}", interesting_folders);
+
+    for &(ref script_url, ref sm_ref, missing) in sourcemaps {
+        println!("{}◦ {}", prefix, script_url.to_string().cyan());
+        if let &Some(ref sm_ref) = sm_ref {
+            println!("{}  -> {}", prefix, sm_ref.to_string().magenta());
+        }
+    }
+
+    Ok(())
+}
+
 pub fn execute<'a>(matches: &ArgMatches<'a>, config: &Config) -> Result<()> {
     let url = Url::parse(matches.value_of("url").unwrap())?;
     let url_str = url.to_string();
     let api = Api::new(config);
 
-    println!("› Analyzing {}", url_str.cyan());
+    println!("› Finding scripts on {}", url_str.cyan());
 
     let resp = api.get_handle_redirect(&url_str)?.to_result()?;
     if resp.url() != &url {
@@ -122,10 +177,20 @@ pub fn execute<'a>(matches: &ArgMatches<'a>, config: &Config) -> Result<()> {
         println!("  ◦ {}", script_url.to_string().cyan());
     }
 
-    println!("› Resolving Sourcemaps:");
+    let mut sourcemaps = vec![];
+    let mut missing_sourcemaps = 0;
+
+    println!("› Analyzing scripts:");
     for script_url in &scripts {
         let script_url_str = script_url.to_string();
+        if is_community_cdn_url(script_url) {
+            println!("  Ⅰ {}", script_url_str.yellow());
+            println!("    known community CDN provided script; ignoring");
+            continue;
+        }
+
         let resp = api.get_handle_redirect(&script_url_str)?;
+
         if resp.failed() {
             println!("  ✕ {} [{}]", script_url_str.red(), resp.status());
             continue;
@@ -150,6 +215,8 @@ pub fn execute<'a>(matches: &ArgMatches<'a>, config: &Config) -> Result<()> {
                 let resp = api.get_handle_redirect(&sm_url_str)?;
                 if resp.failed() {
                     println!("    ✕ {} [{}]", sm_url_str.red(), resp.status());
+                    sourcemaps.push((script_url.clone(), Some(sm_url.clone()), false));
+                    missing_sourcemaps += 1;
                 } else {
                     println!("    ✓ {}", sm_url_str.green());
                     let body = resp.body_as_bytes()?;
@@ -160,13 +227,31 @@ pub fn execute<'a>(matches: &ArgMatches<'a>, config: &Config) -> Result<()> {
                     } else {
                         println!("      {} sourcemap", "not a valid".red());
                     }
+                    sourcemaps.push((script_url.clone(), Some(sm_url.clone()), true));
                 }
             } else {
-                println!("    minified {} sourcemap", "without".red());
+                println!("    minified {} sourcemap reference", "without".red());
+                sourcemaps.push((script_url.clone(), None, false));
+                missing_sourcemaps += 1;
             }
         } else {
             println!("    unminified");
         }
+    }
+
+    if missing_sourcemaps > 0 {
+        println!("› Found {} missing sourcemap(s) that need uploading",
+                 missing_sourcemaps.to_string().yellow());
+    } else {
+        println!("› No missing sourcemaps found!");
+        if !sourcemaps.is_empty() {
+            println!("  (but there are {} sourcemap(s) you should consider uploading)",
+                     sourcemaps.len().to_string().yellow());
+        }
+    }
+
+    if !sourcemaps.is_empty() {
+        explain_upload_commands(&sourcemaps)?;
     }
 
     Ok(())
