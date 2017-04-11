@@ -215,7 +215,7 @@ fn explain_upload_commands(api: &Api, org: &str, project: &str, version: &str,
         }
     } else {
         println!("{} :(", "Cannot find valid sourcemaps locally".red());
-        println!("  Looks like we could not found any matching sourcemaps.");
+        println!("  Looks like we could not find any matching sourcemaps.");
         println!("  Consult the sentry docs for more information about how to");
         println!("  generate sourcemaps.");
     }
